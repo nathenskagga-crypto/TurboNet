@@ -57,7 +57,7 @@ bool fetch_about_config_handler(struct fetch_about_context *ctx)
 
 	res = fetch_about_ssenddataf(ctx,
 			"<html>\n<head>\n"
-			"<title>NetSurf Browser Config</title>\n"
+			"<title>TurboNet Browser Config</title>\n"
 			"<link rel=\"stylesheet\" type=\"text/css\" "
 			"href=\"resource:internal.css\">\n"
 			"</head>\n"
