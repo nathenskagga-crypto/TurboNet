@@ -1,9 +1,9 @@
-Quick Build Steps for NetSurf
+Quick Build Steps for TurboNet
 =============================
 
-Last Updated: 28th May 2024
+Last Updated: 3 May 2026
 
-This document provides steps for building NetSurf.
+This document provides steps for building TurboNet.
 
 These instructions use a shell script to perform several operations.
   This script has only been tested with the bash and zsh bourne style
@@ -53,7 +53,7 @@ Update the environment settings after package installation
      $ source env.sh
 
 
-Get the NetSurf project source code from Git
+Get the TurboNet project source code from Git
 --------------------------------------------
 
 All the sources for the browser and support libraries is available
@@ -64,10 +64,10 @@ Local copies may be easily obtained with the ns-clone command.
      $ ns-clone
 
 
-Build and install NetSurf project libraries
+Build and install TurboNet project libraries
 -------------------------------------------
 
-Updates NetSurf project library sources to latest, builds and installs them.
+Updates TurboNet project library sources to latest, builds and installs them.
 
       $ ns-pull-install
 
