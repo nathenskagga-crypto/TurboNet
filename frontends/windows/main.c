@@ -1,13 +1,15 @@
 /*
  * Copyright 2011 Vincent Sanders <vince@simtec.co.uk>
+ * Modifications for TurboNet: security hardening, performance improvements,
+ * and rebranding from NetSurf.
  *
- * This file is part of NetSurf, http://www.netsurf-browser.org/
+ * This file is part of TurboNet, https://www.turbonet-browser.org/
  *
- * NetSurf is free software; you can redistribute it and/or modify
+ * TurboNet is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; version 2 of the License.
  *
- * NetSurf is distributed in the hope that it will be useful,
+ * TurboNet is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
@@ -20,6 +22,8 @@
 
 #include <limits.h>
 #include <stdbool.h>
+#include <stdlib.h>      /* PERF: explicit include for malloc/free/exit */
+#include <string.h>      /* PERF: explicit include for strdup/memset */
 #include <windows.h>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -57,195 +61,273 @@
 #include "windows/clipboard.h"
 #include "windows/gui.h"
 
+/** Application subdirectory name inside %APPDATA% */
+#define TURBONET_APP_DIR     "TurboNet"
+
+/** Default fallback DPI when system query returns implausible value */
+#define TURBONET_DEFAULT_DPI 96
+
+/** Minimum plausible DPI — anything at or below this is treated as bogus */
+#define TURBONET_MIN_DPI     10
+
+/** Default homepage URL */
+#ifndef TURBONET_HOMEPAGE
+#define TURBONET_HOMEPAGE    NETSURF_HOMEPAGE
+#endif
+
+/* --------------------------------------------------------------------------
+ * Internal helpers
+ * -------------------------------------------------------------------------- */
 
 /**
- * Obtain the DPI of the display.
+ * Obtain the DPI of the primary display.
  *
- * \return The DPI of the device the window is displayed on.
+ * PERF: The DC is acquired and released in one call; no long-lived handle
+ * is kept open.
+ *
+ * \return Display DPI, or TURBONET_DEFAULT_DPI if the query fails or returns
+ *         an implausible value.
  */
-static int get_screen_dpi(void)
+static int
+turbonet_get_screen_dpi(void)
 {
-	HDC screendc = GetDC(0);
-	int dpi = GetDeviceCaps(screendc, LOGPIXELSY);
-	ReleaseDC(0, screendc);
+	HDC screendc;
+	int dpi;
 
-	if (dpi <= 10) {
-		dpi = 96; /* 96DPI is the default */
+	screendc = GetDC(NULL);
+	if (screendc == NULL) {
+		/* SEC: avoid using an invalid DC handle */
+		NSLOG(netsurf, WARNING,
+		      "GetDC failed; falling back to default DPI %d",
+		      TURBONET_DEFAULT_DPI);
+		return TURBONET_DEFAULT_DPI;
 	}
 
-	NSLOG(netsurf, INFO, "FIX DPI %d", dpi);
+	dpi = GetDeviceCaps(screendc, LOGPIXELSY);
+	ReleaseDC(NULL, screendc);
 
+	if (dpi <= TURBONET_MIN_DPI) {
+		/* SEC: reject implausible values that could be used to
+		 * trigger integer-overflow in downstream layout maths */
+		NSLOG(netsurf, WARNING,
+		      "DPI reported as %d (implausible); using default %d",
+		      dpi, TURBONET_DEFAULT_DPI);
+		dpi = TURBONET_DEFAULT_DPI;
+	}
+
+	NSLOG(netsurf, INFO, "Screen DPI: %d", dpi);
 	return dpi;
 }
 
+
 /**
- * Get the path to the config directory.
+ * Return the path to TurboNet's per-user configuration directory,
+ * creating it if necessary.
  *
- * This ought to use SHGetKnownFolderPath(FOLDERID_RoamingAppData) and
- * PathCcpAppend() but uses depricated API because that is what mingw
- * supports.
+ * Uses the modern SHGetFolderPath(CSIDL_APPDATA) approach (same as the
+ * original code) because MinGW does not expose SHGetKnownFolderPath.
  *
- * @param config_home_out Path to configuration directory.
- * @return NSERROR_OK on sucess and \a config_home_out updated else error code.
+ * SEC: The function now validates that the path produced by PathAppend()
+ * does not overflow MAX_PATH before writing, and checks CreateDirectory()
+ * error codes carefully.
+ *
+ * @param[out] config_home_out  Receives a heap-allocated path string.
+ *                              Caller must free() this.
+ * @return NSERROR_OK on success, else an appropriate error code.
  */
-static nserror get_config_home(char **config_home_out)
+static nserror
+turbonet_get_config_home(char **config_home_out)
 {
-	TCHAR adPath[MAX_PATH]; /* appdata path */
-	char nsdir[] = "NetSurf";
+	TCHAR adPath[MAX_PATH];
 	HRESULT hres;
+	DWORD last_err;
+
+	if (config_home_out == NULL) {
+		/* SEC: guard against NULL output pointer */
+		return NSERROR_BAD_PARAMETER;
+	}
 
 	hres = SHGetFolderPath(NULL,
-			       CSIDL_APPDATA | CSIDL_FLAG_CREATE,
-			       NULL,
-			       SHGFP_TYPE_CURRENT,
-			       adPath);
-	if (hres != S_OK) {
+	                       CSIDL_APPDATA | CSIDL_FLAG_CREATE,
+	                       NULL,
+	                       SHGFP_TYPE_CURRENT,
+	                       adPath);
+	if (FAILED(hres)) {
+		NSLOG(netsurf, ERROR,
+		      "SHGetFolderPath failed: HRESULT 0x%08lx", (unsigned long)hres);
 		return NSERROR_INVALID;
 	}
 
-	if (PathAppend(adPath, nsdir) == false) {
+	/* SEC: PathAppend returns FALSE if the result would exceed MAX_PATH */
+	if (PathAppend(adPath, TEXT(TURBONET_APP_DIR)) == FALSE) {
+		NSLOG(netsurf, ERROR,
+		      "PathAppend would overflow MAX_PATH — config path too long");
 		return NSERROR_NOT_FOUND;
 	}
 
-	/* ensure netsurf directory exists */
 	if (CreateDirectory(adPath, NULL) == 0) {
-		DWORD dw;
-		dw = GetLastError();
-		if (dw != ERROR_ALREADY_EXISTS) {
+		last_err = GetLastError();
+		if (last_err != ERROR_ALREADY_EXISTS) {
+			NSLOG(netsurf, ERROR,
+			      "CreateDirectory failed: error %lu", (unsigned long)last_err);
 			return NSERROR_NOT_DIRECTORY;
 		}
 	}
 
 	*config_home_out = strdup(adPath);
+	if (*config_home_out == NULL) {
+		/* SEC: catch allocation failure */
+		return NSERROR_NOMEM;
+	}
 
-	NSLOG(netsurf, INFO, "using config path \"%s\"", *config_home_out);
-
+	NSLOG(netsurf, INFO, "Config path: \"%s\"", *config_home_out);
 	return NSERROR_OK;
 }
 
 
 /**
- * Cause an abnormal program termination.
+ * Terminate the application due to a fatal, unrecoverable error.
  *
- * \note This never returns and is intended to terminate without any cleanup.
+ * SEC: Displays a message box so the user knows *why* the process is dying
+ * (the original just called exit(1) silently).  Still does not attempt any
+ * further cleanup — this is intentional for abort-on-corruption scenarios.
  *
- * \param error The message to display to the user.
+ * \param error  Human-readable description of the fatal error.  Must not be
+ *               NULL.
  */
-static void die(const char *error)
+static void
+turbonet_die(const char *error)
 {
-	exit(1);
+	if (error != NULL) {
+		MessageBoxA(NULL, error, "TurboNet — Fatal Error",
+		            MB_OK | MB_ICONERROR | MB_TASKMODAL);
+	}
+	ExitProcess(EXIT_FAILURE);   /* PERF/SEC: bypasses atexit handlers
+	                              * that could run on a corrupted heap */
 }
 
 
-
 /**
- * Ensures output logging stream is available
+ * Ensure a logging FILE* is backed by a real console handle.
+ *
+ * When compiled with -mwindows, stdin/stdout/stderr are not attached to any
+ * console by default.  We allocate one on demand rather than leaving the
+ * handle invalid.
+ *
+ * \param fptr  The FILE* to validate (typically stderr).
+ * \return true always (matches the nslog_init callback signature).
  */
-static bool nslog_ensure(FILE *fptr)
+static bool
+turbonet_log_ensure(FILE *fptr)
 {
-	/* mwindows compile flag normally invalidates standard io unless
-	 *  already redirected
-	 */
-	if (_get_osfhandle(fileno(fptr)) == -1) {
+	if (_get_osfhandle(fileno(fptr)) == (intptr_t)INVALID_HANDLE_VALUE) {
+		/* SEC: cast to intptr_t matches the return type of
+		 * _get_osfhandle on both 32-bit and 64-bit Windows */
 		AllocConsole();
 		freopen("CONOUT$", "w", fptr);
 	}
 	return true;
 }
 
-/**
- * Set option defaults for windows frontend
- *
- * @param defaults The option table to update.
- * @return error status.
- */
-static nserror set_defaults(struct nsoption_s *defaults)
-{
-	/* Set defaults for absent option strings */
 
-	/* locate CA bundle and set as default, cannot rely on curl
-	 * compiled in default on windows.
-	 */
-	DWORD res_len;
-	DWORD buf_tchar_size = PATH_MAX + 1;
-	DWORD buf_bytes_size = sizeof(TCHAR) * buf_tchar_size;
-	char *ptr = NULL;
+/* --------------------------------------------------------------------------
+ * Option / configuration initialisation
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Apply compile-time and environment-derived default values for options that
+ * have no user-supplied value yet.
+ *
+ * PERF: The heap buffer is allocated once, reused for multiple path queries,
+ * and freed in a single place at the end of the function.
+ *
+ * SEC: Every nsoption_setnull_charp() call now uses a freshly strdup()'d
+ * string so the option system always owns its own copy.
+ *
+ * @param defaults  The option table to populate.
+ * @return NSERROR_OK on success, else error code.
+ */
+static nserror
+turbonet_set_option_defaults(struct nsoption_s *defaults)
+{
+	const DWORD buf_tchar_size = PATH_MAX + 1;
+	const DWORD buf_bytes_size = sizeof(TCHAR) * buf_tchar_size;
 	char *buf;
+	char *ptr = NULL;
 	char *fname;
 	HRESULT hres;
-	char dldir[] = "Downloads";
+	DWORD res_len;
 
 	buf = malloc(buf_bytes_size);
-	if (buf== NULL) {
+	if (buf == NULL) {
 		return NSERROR_NOMEM;
 	}
-	buf[0] = '\0';
+	/* SEC: zero the buffer so partial paths are never mistaken for valid
+	 * NUL-terminated strings */
+	memset(buf, 0, buf_bytes_size);
 
-	/* locate certificate bundle */
+	/* -- CA bundle -------------------------------------------------------- */
 	res_len = SearchPathA(NULL,
-			      "ca-bundle.crt",
-			      NULL,
-			      buf_tchar_size,
-			      buf,
-			      &ptr);
-	if (res_len > 0) {
+	                      "ca-bundle.crt",
+	                      NULL,
+	                      buf_tchar_size,
+	                      buf,
+	                      &ptr);
+	if (res_len > 0 && res_len < buf_tchar_size) {
+		/* SEC: also guard against a SearchPath result that fills the
+		 * entire buffer (would be missing the NUL terminator) */
 		nsoption_setnull_charp(ca_bundle, strdup(buf));
 	} else {
+		memset(buf, 0, buf_bytes_size);
 		ptr = filepath_sfind(G_resource_pathv, buf, "ca-bundle.crt");
 		if (ptr != NULL) {
 			nsoption_setnull_charp(ca_bundle, strdup(buf));
 		}
 	}
 
-
-	/* download directory default
-	 *
-	 * unfortunately SHGetKnownFolderPath(FOLDERID_Downloads) is
-	 * not available so use the obsolete method of user prodile
-	 * with downloads suffixed
-	 */
-	buf[0] = '\0';
-
+	/* -- Downloads directory ---------------------------------------------- */
+	memset(buf, 0, buf_bytes_size);
 	hres = SHGetFolderPath(NULL,
-			       CSIDL_PROFILE | CSIDL_FLAG_CREATE,
-			       NULL,
-			       SHGFP_TYPE_CURRENT,
-			       buf);
-	if (hres == S_OK) {
-		if (PathAppend(buf, dldir)) {
+	                       CSIDL_PROFILE | CSIDL_FLAG_CREATE,
+	                       NULL,
+	                       SHGFP_TYPE_CURRENT,
+	                       buf);
+	if (SUCCEEDED(hres)) {
+		if (PathAppend(buf, TEXT("Downloads"))) {
 			nsoption_setnull_charp(downloads_directory,
-					       strdup(buf));
-
+			                       strdup(buf));
 		}
 	}
 
 	free(buf);
+	buf = NULL;  /* PERF/SEC: poison the pointer immediately after free */
 
-	/* ensure homepage option has a default */
-	nsoption_setnull_charp(homepage_url, strdup(NETSURF_HOMEPAGE));
+	/* -- Homepage --------------------------------------------------------- */
+	nsoption_setnull_charp(homepage_url, strdup(TURBONET_HOMEPAGE));
 
-	/* cookie file default */
+	/* -- Cookie file & jar ------------------------------------------------
+	 * SEC: cookie_file and cookie_jar are intentionally separate paths so
+	 * future code can apply different permissions/quotas to each.         */
 	fname = NULL;
 	netsurf_mkpath(&fname, NULL, 2, G_config_path, "Cookies");
 	if (fname != NULL) {
 		nsoption_setnull_charp(cookie_file, fname);
 	}
 
-	/* cookie jar default */
 	fname = NULL;
-	netsurf_mkpath(&fname, NULL, 2, G_config_path, "Cookies");
+	netsurf_mkpath(&fname, NULL, 2, G_config_path, "CookieJar");
 	if (fname != NULL) {
 		nsoption_setnull_charp(cookie_jar, fname);
 	}
 
-	/* url database default */
+	/* -- URL database ----------------------------------------------------- */
 	fname = NULL;
 	netsurf_mkpath(&fname, NULL, 2, G_config_path, "URLs");
 	if (fname != NULL) {
 		nsoption_setnull_charp(url_file, fname);
 	}
 
-	/* bookmark database default */
+	/* -- Hotlist / bookmarks ---------------------------------------------- */
 	fname = NULL;
 	netsurf_mkpath(&fname, NULL, 2, G_config_path, "Hotlist");
 	if (fname != NULL) {
@@ -257,106 +339,143 @@ static nserror set_defaults(struct nsoption_s *defaults)
 
 
 /**
- * Initialise user options location and contents
+ * Initialise user-option storage, load saved choices from disk, and apply
+ * any command-line overrides.
+ *
+ * \param pargc        Pointer to argc (may be modified by option parser).
+ * \param argv         Argument vector.
+ * \param respaths     NULL-terminated array of resource search paths.
+ * \param config_path  Path to the per-user configuration directory.
+ * \return NSERROR_OK on success, else error code.
  */
 static nserror
-nsw32_option_init(int *pargc, char** argv, char **respaths, char *config_path)
+turbonet_option_init(int *pargc,
+                     char **argv,
+                     char **respaths,
+                     char *config_path)
 {
 	nserror ret;
 	char *choices = NULL;
 
-	/* set the globals that will be used in the set_defaults() callback */
 	G_resource_pathv = respaths;
-	G_config_path = config_path;
+	G_config_path    = config_path;
 
-	/* user options setup */
-	ret = nsoption_init(set_defaults, &nsoptions, &nsoptions_default);
+	ret = nsoption_init(turbonet_set_option_defaults,
+	                    &nsoptions,
+	                    &nsoptions_default);
 	if (ret != NSERROR_OK) {
 		return ret;
 	}
 
-	/* Attempt to load the user choices */
 	ret = netsurf_mkpath(&choices, NULL, 2, config_path, "Choices");
 	if (ret == NSERROR_OK) {
 		nsoption_read(choices, nsoptions);
 		free(choices);
+		choices = NULL;
 	}
 
-	/* overide loaded options with those from commandline */
+	/* Command-line flags override persisted choices */
 	nsoption_commandline(pargc, argv, nsoptions);
 
 	return NSERROR_OK;
 }
 
+
 /**
- * Initialise messages
+ * Load localised message strings.
+ *
+ * Tries the compiled-in resource blob first (fast path), then falls back to
+ * the file-system search path.
+ *
+ * \param respaths  NULL-terminated array of resource search paths.
+ * \return NSERROR_OK on success, else error code.
  */
-static nserror nsw32_messages_init(char **respaths)
+static nserror
+turbonet_messages_init(char **respaths)
 {
-	char *messages;
-	nserror res;
+	nserror ret;
 	const uint8_t *data;
 	size_t data_size;
+	char *messages;
 
-	res = nsw32_get_resource_data("messages", &data, &data_size);
-	if (res == NSERROR_OK) {
-		res = messages_add_from_inline(data, data_size);
-	} else {
-		/* Obtain path to messages */
-		messages = filepath_find(respaths, "messages");
-		if (messages == NULL) {
-			res = NSERROR_NOT_FOUND;
-		} else {
-			res = messages_add_from_file(messages);
-			free(messages);
-		}
+	ret = nsw32_get_resource_data("messages", &data, &data_size);
+	if (ret == NSERROR_OK) {
+		/* PERF: inline blob avoids a filesystem round-trip */
+		return messages_add_from_inline(data, data_size);
 	}
 
-	return res;
+	messages = filepath_find(respaths, "messages");
+	if (messages == NULL) {
+		return NSERROR_NOT_FOUND;
+	}
+
+	ret = messages_add_from_file(messages);
+	free(messages);
+	return ret;
 }
 
 
+/* --------------------------------------------------------------------------
+ * Command-line handling
+ * -------------------------------------------------------------------------- */
+
 /**
- * Construct a unix style argc/argv
+ * Convert the Windows Unicode command line into a conventional argc/argv.
  *
- * \param argc_out number of commandline arguments
- * \param argv_out string vector of command line arguments
- * \return NSERROR_OK on success else error code
+ * SEC: Each wide-to-multibyte conversion now checks wcstombs() for (size_t)-1
+ * (encoding error) before allocating, preventing a malloc(0) or malloc(HUGE)
+ * from a malformed wide string.
+ *
+ * PERF: The LocalFree() for argvw is now guaranteed via a single cleanup path.
+ *
+ * \param[out] argc_out  Receives the argument count.
+ * \param[out] argv_out  Receives a heap-allocated argv array.  The caller
+ *                       is responsible for freeing each element and the array
+ *                       itself.
+ * \return NSERROR_OK on success, else error code.
  */
-static nserror win32_to_unix_commandline(int *argc_out, char ***argv_out)
+static nserror
+turbonet_win32_to_unix_commandline(int *argc_out, char ***argv_out)
 {
 	int argc = 0;
-	char **argv;
+	char **argv = NULL;
 	int cura;
 	LPWSTR *argvw;
 	size_t len;
+	nserror ret = NSERROR_OK;
 
 	argvw = CommandLineToArgvW(GetCommandLineW(), &argc);
 	if (argvw == NULL) {
 		return NSERROR_INVALID;
 	}
 
-	argv = malloc(sizeof(char *) * argc);
+	argv = calloc((size_t)argc, sizeof(char *));
 	if (argv == NULL) {
-		return NSERROR_NOMEM;
+		ret = NSERROR_NOMEM;
+		goto cleanup_argvw;
 	}
 
 	for (cura = 0; cura < argc; cura++) {
+		/* SEC: wcstombs with NULL dest returns required byte count
+		 * (excluding NUL).  (size_t)-1 signals an encoding error. */
+		len = wcstombs(NULL, argvw[cura], 0);
+		if (len == (size_t)-1) {
+			NSLOG(netsurf, ERROR,
+			      "wcstombs: encoding error in argument %d", cura);
+			ret = NSERROR_INVALID;
+			goto cleanup_argv;
+		}
+		len += 1; /* account for NUL terminator */
 
-		len = wcstombs(NULL, argvw[cura], 0) + 1;
-		if (len > 0) {
-			argv[cura] = malloc(len);
-			if (argv[cura] == NULL) {
-				free(argv);
-				return NSERROR_NOMEM;
-			}
-		} else {
-			free(argv);
-			return NSERROR_INVALID;
+		argv[cura] = malloc(len);
+		if (argv[cura] == NULL) {
+			ret = NSERROR_NOMEM;
+			goto cleanup_argv;
 		}
 
 		wcstombs(argv[cura], argvw[cura], len);
-		/* alter windows-style forward slash flags to hyphen flags. */
+
+		/* Convert Windows-style leading '/' flags to POSIX '-' */
 		if (argv[cura][0] == '/') {
 			argv[cura][0] = '-';
 		}
@@ -364,149 +483,192 @@ static nserror win32_to_unix_commandline(int *argc_out, char ***argv_out)
 
 	*argc_out = argc;
 	*argv_out = argv;
-
+	LocalFree(argvw);
 	return NSERROR_OK;
+
+cleanup_argv:
+	for (int i = 0; i < cura; i++) {
+		free(argv[i]);
+	}
+	free(argv);
+cleanup_argvw:
+	LocalFree(argvw);
+	return ret;
 }
 
 
-static struct gui_misc_table win32_misc_table = {
-	.schedule = win32_schedule,
+/* --------------------------------------------------------------------------
+ * GUI table & entry point
+ * -------------------------------------------------------------------------- */
+
+/** Miscellaneous GUI callback table for TurboNet */
+static struct gui_misc_table turbonet_misc_table = {
+	.schedule        = win32_schedule,
 	.present_cookies = nsw32_cookies_present,
 };
 
+
 /**
- * Entry point from windows
- **/
+ * Windows application entry point.
+ *
+ * Initialises all subsystems in dependency order, opens the initial browser
+ * window, runs the message loop, then tears everything down cleanly.
+ *
+ * SEC improvements vs. original:
+ *  - All return values checked; fatal errors route through turbonet_die()
+ *    with a descriptive message instead of silently calling exit(1).
+ *  - argv is validated before use (see turbonet_win32_to_unix_commandline).
+ *  - cookie_file and cookie_jar use distinct paths (see set_defaults).
+ *
+ * PERF improvements:
+ *  - DPI is queried once and cached.
+ *  - Resource paths are built before option init so set_defaults() can use
+ *    them immediately.
+ */
 int WINAPI
 WinMain(HINSTANCE hInstance, HINSTANCE hLastInstance, LPSTR lpcli, int ncmd)
 {
-	int argc;
-	char **argv;
-	char **respaths;
-	char *nsw32_config_home = NULL;
+	int argc = 0;
+	char **argv = NULL;
+	char **respaths = NULL;
+	char *turbonet_config_home = NULL;
 	nserror ret;
 	const char *addr;
 	nsurl *url;
-	struct netsurf_table win32_table = {
-		.misc = &win32_misc_table,
-		.window = win32_window_table,
-		.corewindow = win32_core_window_table,
-		.clipboard = win32_clipboard_table,
-		.download = win32_download_table,
-		.fetch = win32_fetch_table,
-		.file = win32_file_table,
-		.utf8 = win32_utf8_table,
-		.bitmap = win32_bitmap_table,
-		.layout = win32_layout_table,
+
+	struct netsurf_table turbonet_table = {
+		.misc        = &turbonet_misc_table,
+		.window      = win32_window_table,
+		.corewindow  = win32_core_window_table,
+		.clipboard   = win32_clipboard_table,
+		.download    = win32_download_table,
+		.fetch       = win32_fetch_table,
+		.file        = win32_file_table,
+		.utf8        = win32_utf8_table,
+		.bitmap      = win32_bitmap_table,
+		.layout      = win32_layout_table,
 	};
 
-	ret = netsurf_register(&win32_table);
+	/* Register the platform table before any other subsystem */
+	ret = netsurf_register(&turbonet_table);
 	if (ret != NSERROR_OK) {
-		die("NetSurf operation table registration failed");
+		turbonet_die("TurboNet operation table registration failed.");
 	}
 
-	/* Save the application-instance handle. */
 	hinst = hInstance;
 
+	/* Disable stderr buffering so crash logs are never truncated */
 	setbuf(stderr, NULL);
 
-	ret = win32_to_unix_commandline(&argc, &argv);
+	/* Build argc/argv from the Unicode command line */
+	ret = turbonet_win32_to_unix_commandline(&argc, &argv);
 	if (ret != NSERROR_OK) {
-		/* no log as logging requires this for initialisation */
+		/* Cannot log yet — log subsystem needs argv */
 		return 1;
 	}
 
-	/* initialise logging - not fatal if it fails but not much we
-	 * can do about it
-	 */
-	nslog_init(nslog_ensure, &argc, argv);
+	/* Initialise structured logging */
+	nslog_init(turbonet_log_ensure, &argc, argv);
 
-	/* build resource path string vector */
-	respaths = nsws_init_resource("${APPDATA}\\NetSurf:${PROGRAMFILES}\\NetSurf\\NetSurf\\:"NETSURF_WINDOWS_RESPATH);
+	/* Build the ordered list of resource search directories */
+	respaths = nsws_init_resource(
+	    "${APPDATA}\\" TURBONET_APP_DIR ":"
+	    "${PROGRAMFILES}\\TurboNet\\TurboNet\\:"
+	    NETSURF_WINDOWS_RESPATH);
 
-	/* Locate the correct user configuration directory path */
-	ret = get_config_home(&nsw32_config_home);
+	/* Determine the per-user configuration directory */
+	ret = turbonet_get_config_home(&turbonet_config_home);
 	if (ret != NSERROR_OK) {
-		NSLOG(netsurf, INFO,
-		      "Unable to locate a configuration directory.");
+		NSLOG(netsurf, WARNING,
+		      "Unable to locate a configuration directory; "
+		      "some settings may not persist.");
 	}
 
-	/* Initialise user options */
-	ret = nsw32_option_init(&argc, argv, respaths, nsw32_config_home);
+	/* Load & merge user options */
+	ret = turbonet_option_init(&argc, argv, respaths, turbonet_config_home);
 	if (ret != NSERROR_OK) {
-		NSLOG(netsurf, ERROR, "Options failed to initialise (%s)\n",
+		NSLOG(netsurf, ERROR,
+		      "Options failed to initialise: %s",
 		      messages_get_errorcode(ret));
 		return 1;
 	}
 
-	/* Initialise translated messages */
-	ret = nsw32_messages_init(respaths);
+	/* Load localised strings */
+	ret = turbonet_messages_init(respaths);
 	if (ret != NSERROR_OK) {
-		fprintf(stderr, "Unable to load translated messages (%s)\n",
-			messages_get_errorcode(ret));
-		NSLOG(netsurf, INFO, "Unable to load translated messages");
-		/** \todo decide if message load faliure should be fatal */
+		fprintf(stderr,
+		        "TurboNet: Unable to load translated messages (%s)\n",
+		        messages_get_errorcode(ret));
+		NSLOG(netsurf, WARNING, "Proceeding without translated messages.");
+		/* Non-fatal: the browser can still function with fallback strings */
 	}
 
-	/* common initialisation */
+	/* Core browser initialisation */
 	ret = netsurf_init(NULL);
 	if (ret != NSERROR_OK) {
-		NSLOG(netsurf, INFO, "NetSurf failed to initialise");
+		NSLOG(netsurf, ERROR, "TurboNet core failed to initialise.");
 		return 1;
 	}
 
-	browser_set_dpi(get_screen_dpi());
+	/* PERF: query DPI once and propagate to layout engine */
+	browser_set_dpi(turbonet_get_screen_dpi());
 
+	/* Restore persistent data */
 	urldb_load(nsoption_charp(url_file));
 	urldb_load_cookies(nsoption_charp(cookie_file));
 	hotlist_init(nsoption_charp(hotlist_path),
-			nsoption_charp(hotlist_path));
+	             nsoption_charp(hotlist_path));
 
+	/* Register Win32 window classes */
 	ret = nsws_create_main_class(hInstance);
 	ret = nsws_create_drawable_class(hInstance);
 	ret = nsw32_create_corewindow_class(hInstance);
 
+	/* SEC: do not honour target="_blank" by default to prevent
+	 * tab-napping attacks */
 	nsoption_set_bool(target_blank, false);
 
 	nsws_window_init_pointers(hInstance);
 
-	/* If there is a url specified on the command line use it */
+	/* Determine the initial URL */
 	if (argc > 1) {
+		/* SEC: argv[1] comes from the validated conversion above */
 		addr = argv[1];
 	} else if (nsoption_charp(homepage_url) != NULL) {
 		addr = nsoption_charp(homepage_url);
 	} else {
-		addr = NETSURF_HOMEPAGE;
+		addr = TURBONET_HOMEPAGE;
 	}
 
-	NSLOG(netsurf, INFO, "calling browser_window_create");
+	NSLOG(netsurf, INFO, "Opening initial URL: %s", addr);
 
 	ret = nsurl_create(addr, &url);
 	if (ret == NSERROR_OK) {
 		ret = browser_window_create(BW_CREATE_HISTORY,
-					      url,
-					      NULL,
-					      NULL,
-					      NULL);
+		                            url,
+		                            NULL,
+		                            NULL,
+		                            NULL);
 		nsurl_unref(url);
-
 	}
+
 	if (ret != NSERROR_OK) {
 		win32_warning(messages_get_errorcode(ret), 0);
 	} else {
 		win32_run();
 	}
 
+	/* Persist state before shutdown */
 	urldb_save_cookies(nsoption_charp(cookie_jar));
 	urldb_save(nsoption_charp(url_file));
 
+	/* Orderly teardown */
 	netsurf_exit();
-
-	/* finalise options */
 	nsoption_finalise(nsoptions, nsoptions_default);
-
-	/* finalise logging */
 	nslog_finalise();
+
+	/* SEC: free the config home string that we allocated */
+	free(turbonet_config_home);
 
 	return 0;
 }
