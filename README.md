@@ -1,10 +1,10 @@
-NetSurf
+TurboNet
 =======
 
 This document should help point you at various useful bits of information.
 
 
-Building NetSurf
+Building TurboNet
 ----------------
 
 Read the [Quick Start](docs/quick-start.md) document for instructions.
